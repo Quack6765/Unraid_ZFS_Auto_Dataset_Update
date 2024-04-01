@@ -19,15 +19,16 @@
 # ---------------------------------------
 
 # real run or dry run
-dry_run="no"  # Set to "yes" for a dry run. Change to "no" to run for real
+dry_run="yes"  # Set to "yes" for a dry run. Change to "no" to run for real
 
 # Paths
 # ---------------------------------------
 
 # Process Docker Containers
-should_process_containers="no"  # set to "yes" to process and convert appdata. set paths below
-source_pool_where_appdata_is="sg1_storage"  #source pool
+should_process_containers="yes"  # set to "yes" to process and convert appdata. set paths below
+source_pool_where_appdata_is="cache"  #source pool
 source_dataset_where_appdata_is="appdata"   #source appdata dataset
+containers_to_ignore=() # Containers to ignore. In the format ("container1" "container2" "container...")
 
 # Process Virtual Machines
 should_process_vms="no"  # set to "yes" to process and convert vm vdisk folders. set paths below
@@ -50,14 +51,20 @@ replace_spaces="no"
 
 # Check if container processing is set to "yes". If so, add location to array and create bind mount compare variable.
 if [[ "$should_process_containers" =~ ^[Yy]es$ ]]; then
-    source_datasets_array+=("${source_pool_where_appdata_is}/${source_dataset_where_appdata_is}")
-    source_path_appdata="$source_pool_where_appdata_is/$source_dataset_where_appdata_is"
+  source_datasets_array+=("${source_pool_where_appdata_is}/${source_dataset_where_appdata_is}")
+  source_path_appdata="$source_pool_where_appdata_is/$source_dataset_where_appdata_is"
 fi
 
 # Check if VM processing is set to "yes". If so, add location to array and create vdisk compare variable.
 if [[ "$should_process_vms" =~ ^[Yy]es$ ]]; then
-    source_datasets_array+=("${source_pool_where_vm_domains_are}/${source_dataset_where_vm_domains_are}")
-    source_path_vms="$source_pool_where_vm_domains_are/$source_dataset_where_vm_domains_are"
+  source_datasets_array+=("${source_pool_where_vm_domains_are}/${source_dataset_where_vm_domains_are}")
+  source_path_vms="$source_pool_where_vm_domains_are/$source_dataset_where_vm_domains_are"
+fi
+
+if [ "$dry_run" == "yes" ]; then
+  extra_formating=" \u21B3 DRY-RUN: "
+else
+  extra_formating=" \u21B3 "
 fi
 
 mount_point="/mnt"
@@ -65,6 +72,7 @@ stopped_containers=()
 stopped_vms=()
 converted_folders=()
 buffer_zone=11
+containers_work=()
 
 #--------------------------------
 #     FUNCTIONS START HERE      #
@@ -108,74 +116,108 @@ is_zfs_dataset() {
 #-----------------------------------------------------------------------------------------------------------------------------------  #
 # this function checks the running containers and sees if bind mounts are folders or datasets and shuts down containers if needed #
 stop_docker_containers() {
-  if [ "$should_process_containers" = "yes" ]; then
-    echo "Checking Docker containers..."
-    
-    for container in $(docker ps -q); do
-      local container_name=$(docker container inspect --format '{{.Name}}' "$container" | cut -c 2-)
-      local bindmounts=$(docker inspect --format '{{ range .Mounts }}{{ if eq .Type "bind" }}{{ .Source }}{{printf "\n"}}{{ end }}{{ end }}' $container) 
-      
-      if [ -z "$bindmounts" ]; then
-        echo "Container ${container_name} has no bind mounts so nothing to convert. No need to stop the container."
-        continue
-      fi
-      
-      local stop_container=false
 
-      while IFS= read -r bindmount; do
-        if [[ "$bindmount" == /mnt/user/* ]]; then
-            bindmount=$(find_real_location "$bindmount")
-            if [[ $? -ne 0 ]]; then
-                echo "Error finding real location for $bindmount in container $container_name."
-                continue
-            fi
-        fi
-
-        # check if bind mount matches source_path_appdata, if not, skip it
-        if [[ "$bindmount" != "/mnt/$source_path_appdata"* ]]; then
-            continue
-        fi
-
-        local immediate_child=$(echo "$bindmount" | sed -n "s|^/mnt/$source_path_appdata/||p" | cut -d "/" -f 1)
-        local combined_path="/mnt/$source_path_appdata/$immediate_child"
-
-        is_zfs_dataset "$combined_path"
-        if [[ $? -eq 1 ]]; then
-          echo "The appdata for container ${container_name} is not a ZFS dataset (it's a folder). Container will be stopped so it can be converted to a dataset."
-          stop_container=true
-          break
-        fi
-      done <<< "$bindmounts"  #  send  bindmounts into the loop
-
-      if [ "$stop_container" = true ]; then
-        docker stop "$container"
-        stopped_containers+=("$container_name")
-      else
-        echo "Container ${container_name} is not required to be stopped as it is already a separate dataset."
-      fi
-    done
-
-    if [ "${#stopped_containers[@]}" -gt 0 ]; then
-      echo "The container/containers ${stopped_containers[*]} has/have been stopped during conversion and will be restarted afterwards."
+  echo -e "${extra_formating}Stopping Docker containers ..."
+  for item in "${containers_work[@]}"
+  do
+    container=$(echo "$item" | cut -d: -f1)
+    if [ "$dry_run" != "yes" ]; then
+      docker stop "$container"
     fi
-  fi
+  done
 }
 #----------------------------------------------------------------------------------    
 # this function restarts any containers that had to be stopped
 #
 start_docker_containers() {
-  if [ "$should_process_containers" = "yes" ]; then
-    for container_name in "${stopped_containers[@]}"; do
-      echo "Restarting Docker container $container_name..."
-      if [ "$dry_run" != "yes" ]; then
-        docker start "$container_name"
-      else
-        echo "Dry Run: Docker container $container_name would be restarted"
-      fi
-    done
-  fi
+
+  echo -e "${extra_formating}Restarting Docker container ..."
+  for item in "${containers_work[@]}"
+  do
+    container=$(echo "$item" | cut -d: -f1)
+    if [ "$dry_run" != "yes" ]; then
+      docker start "$container"
+    fi
+  done
 }
 
+#----------------------------------------------------------------------------------    
+# This function check the eligibility for the docker containers dataset conversion
+#
+check_docker_containers() {
+
+  local container_name=$1
+  local bindmounts=$2
+
+  echo -e "-----------------"
+  echo -e "Container Name: $container_name"
+  echo -e "Container ID: $container"
+  if [ -z "$bindmounts" ]; then
+    echo -e "${extra_formating}No bind mounts so nothing to convert."
+    return
+  fi
+
+  if [[ ${containers_to_ignore[@]} =~ $container_name ]]; then
+    echo -e "${extra_formating}In ignore list. Skipping ..."     
+    return
+  fi
+  echo -e "${extra_formating}Need to convert. Adding to task list"
+
+  while IFS= read -r bindmount; do
+    if [[ "$bindmount" == /mnt/user/* ]]; then
+        bindmount=$(find_real_location "$bindmount")
+        if [[ $? -ne 0 ]]; then
+            echo "Error finding real location for $bindmount in container $container_name."
+            continue
+        fi
+    fi
+
+    # check if bind mount matches source_path_appdata, if not, skip it
+    if [[ "$bindmount" != "/mnt/$source_path_appdata"* ]]; then
+        continue
+    fi
+
+    local immediate_child=$(echo "$bindmount" | sed -n "s|^/mnt/$source_path_appdata/||p" | cut -d "/" -f 1)
+    local combined_path="/mnt/$source_path_appdata/$immediate_child"
+
+    is_zfs_dataset "$combined_path"
+    if [[ $? -eq 1 ]]; then
+      containers_work+=("$container:$container_name")
+      break
+    else
+      break
+    fi
+  done <<< "$bindmounts"
+
+}
+
+#----------------------------------------------------------------------------------    
+# This function execute the main work and checks for docker containers
+#
+main_docker_containers() {
+  for container in $(docker ps -q); do
+    local container_name=$(docker container inspect --format '{{.Name}}' "$container" | cut -c 2-)
+    local bindmounts=$(docker inspect --format '{{ range .Mounts }}{{ if eq .Type "bind" }}{{ .Source }}{{printf "\n"}}{{ end }}{{ end }}' $container) 
+
+    # Checking eligibility
+    check_docker_containers $container_name $bindmounts
+  done
+
+  for item in "${containers_work[@]}"
+  do
+    container=$(echo "$item" | cut -d: -f2)
+    formated_task_list+="$container, "
+  done
+
+  # Do the main work
+  echo -e "-----------------"
+  echo -e "Starting work ..."
+  echo -e "${extra_formating}Task list: $formated_task_list"
+  stop_docker_containers
+  convert
+  start_docker_containers
+
+}
 
 # ----------------------------------------------------------------------------------    
 #this function gets  dataset path from the full vdisk path
@@ -447,7 +489,10 @@ can_i_go_to_work() {
 #
 convert() {
 for dataset in "${source_datasets_array[@]}"; do
-  create_datasets "$dataset"
+  echo -e "${extra_formating}Creating all datasets ..."
+  if [ "$dry_run" != "yes" ]; then
+    create_datasets "$dataset"
+  fi
 done
 }
 
@@ -455,10 +500,13 @@ done
 #    RUN THE FUNCTIONS          #
 #--------------------------------
 can_i_go_to_work
-stop_docker_containers
-stop_virtual_machines
-convert
-start_docker_containers
-start_virtual_machines
-print_new_datasets
+if [ "$should_process_containers" = "yes" ]; then
+  main_docker_containers
+fi
+#stop_docker_containers
+#stop_virtual_machines
+#convert
+#start_docker_containers
+#start_virtual_machines
+#print_new_datasets
 
