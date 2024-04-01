@@ -1,4 +1,7 @@
 #!/bin/bash
+#
+# WIP DO NOT USE !
+#
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 # #   Script for watching a dataset and auto updating regular folders converting them to datasets                                         # #
 # #   (needs Unraid 6.12 or above)                                                                                                        # # 
@@ -28,7 +31,8 @@ dry_run="yes"  # Set to "yes" for a dry run. Change to "no" to run for real
 should_process_containers="yes"  # set to "yes" to process and convert appdata. set paths below
 source_pool_where_appdata_is="cache"  #source pool
 source_dataset_where_appdata_is="appdata"   #source appdata dataset
-containers_to_ignore=() # Containers to ignore. In the format ("container1" "container2" "container...")
+containers_to_ignore=( "binhex-minecraftbedrockserver" "n8n" "Ntfy" "binhex-code-server" "Kopia-USB" "autobrr" "ddns-updater" "bazarr-anime" "bazarr-4k" "binhex-sonarr-anime" "bazarr" "binhex-prowlarr" "CloudBeaver" "sqlitebrowser" "overseerr" "overseerr-anime" "binhex-radarr-4k" "binhex-radarr" "sabnzbd" "omada-controller" "Home-Assistant-Core" "calibre" "baserow" "binhex-delugevpn" "prometheus" "mysql" "jellyseerr" "picoshare" "Authelia" "tasks.md" "FileBrowser" "CaddyV2" "Apache-WebDAV" "Cups-Airprint" "Grafana" "UptimeKuma" "Plex-Meta-Manager" "tautulli" "wrapperr" "plex-auto-languages"  "binhex-krusader" "unmanic" "Plex-Media-Server" "Notifiarr" "EmbyServer" "binhex-sonarr-tv") # Containers to ignore. In the format ("container1" "container2" "container...")
+
 
 # Process Virtual Machines
 should_process_vms="no"  # set to "yes" to process and convert vm vdisk folders. set paths below
@@ -161,7 +165,7 @@ check_docker_containers() {
     echo -e "${extra_formating}In ignore list. Skipping ..."     
     return
   fi
-  echo -e "${extra_formating}Need to convert. Adding to task list"
+
 
   while IFS= read -r bindmount; do
     if [[ "$bindmount" == /mnt/user/* ]]; then
@@ -174,7 +178,8 @@ check_docker_containers() {
 
     # check if bind mount matches source_path_appdata, if not, skip it
     if [[ "$bindmount" != "/mnt/$source_path_appdata"* ]]; then
-        continue
+        echo -e "${extra_formating}Different bind mount than config. Skipping ..."
+        break
     fi
 
     local immediate_child=$(echo "$bindmount" | sed -n "s|^/mnt/$source_path_appdata/||p" | cut -d "/" -f 1)
@@ -182,9 +187,9 @@ check_docker_containers() {
 
     is_zfs_dataset "$combined_path"
     if [[ $? -eq 1 ]]; then
+      echo -e "${extra_formating}Need to convert '${combined_path}'. Adding to task list"
+      echo "adding: $container_name"
       containers_work+=("$container:$container_name")
-      break
-    else
       break
     fi
   done <<< "$bindmounts"
@@ -200,22 +205,28 @@ main_docker_containers() {
     local bindmounts=$(docker inspect --format '{{ range .Mounts }}{{ if eq .Type "bind" }}{{ .Source }}{{printf "\n"}}{{ end }}{{ end }}' $container) 
 
     # Checking eligibility
+    echo "bind: $bindmounts"
     check_docker_containers $container_name $bindmounts
   done
 
   for item in "${containers_work[@]}"
   do
+    echo "item: $item"
     container=$(echo "$item" | cut -d: -f2)
-    formated_task_list+="$container, "
+    formated_task_list+="'$container', "
   done
 
   # Do the main work
   echo -e "-----------------"
   echo -e "Starting work ..."
-  echo -e "${extra_formating}Task list: $formated_task_list"
-  stop_docker_containers
-  convert
-  start_docker_containers
+  if (( ${#containers_work[@]} )); then
+    echo -e "${extra_formating}Task list: $formated_task_list"
+    stop_docker_containers
+    convert
+    start_docker_containers
+  else
+    echo -e "${extra_formating}No task to execute. All good !"
+  fi
 
 }
 
